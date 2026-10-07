@@ -428,7 +428,8 @@ fn reply_refused(
 
 /// One accepted reply's respond task, bounded by the running-task cap. The
 /// reply keeps its origin command (and therefore its generation and client
-/// identity) untouched.
+/// identity) untouched. When no running slot is free the origin entry is
+/// returned for retention instead of being dropped.
 fn spawn_respond(
     client: &Arc<SupervisedClient>,
     replies: &mut tokio::task::JoinSet<Result<(), String>>,
@@ -436,9 +437,9 @@ fn spawn_respond(
     command: IncomingCommand,
     rc: u8,
     body: String,
-) -> bool {
+) -> Result<(), (IncomingCommand, u8, String)> {
     let Ok(permit) = reply_permits.clone().try_acquire_owned() else {
-        return false;
+        return Err((command, rc, body));
     };
     let client = Arc::clone(client);
     replies.spawn(async move {
@@ -448,22 +449,22 @@ fn spawn_respond(
             .map_err(|_| "Bus reply timed out".to_owned())?
             .map_err(|error| format!("Bus reply: {error}"))
     });
-    true
+    Ok(())
 }
 
 /// Spawn retained accepted replies while a running-task slot is free. Callers
 /// pause new-command admission while `accepted` is non-empty, so this queue
-/// can never overflow or drop an accepted reply.
+/// can never overflow or drop an accepted reply. The next entry is extracted
+/// once per attempt; a refusal to spawn returns it and it is restored unread.
 fn spawn_accepted(
     accepted: &mut VecDeque<(IncomingCommand, u8, String)>,
-    mut spawn: impl FnMut(IncomingCommand, u8, String) -> bool,
+    mut spawn: impl FnMut(IncomingCommand, u8, String) -> Result<(), (IncomingCommand, u8, String)>,
 ) {
     while let Some((command, rc, body)) = accepted.pop_front() {
-        if spawn(command, rc, body) {
-            continue;
+        if let Err((command, rc, body)) = spawn(command, rc, body) {
+            accepted.push_front((command, rc, body));
+            break;
         }
-        accepted.push_front((command, rc, body));
-        break;
     }
 }
 
@@ -1071,7 +1072,11 @@ mod tests {
             !mailbox.publish(SettingsEvent::Wake),
             "notification coalesced"
         );
-        assert!(receive.try_recv().unwrap().is_some());
+        assert_eq!(
+            receive.try_recv(),
+            Ok(Delivery::Changed),
+            "the queued delivery is the first real dequeue"
+        );
         assert!(
             outbox.flush(&mut send),
             "the retained wake is delivered once capacity returns"
@@ -1085,9 +1090,9 @@ mod tests {
         let mut settings = 0;
         for _ in 0..=filled {
             match receive.try_recv() {
-                Ok(Some(Delivery::Settings)) => settings += 1,
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
+                Ok(Delivery::Settings) => settings += 1,
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
         assert_eq!(
@@ -1134,7 +1139,7 @@ mod tests {
                 biased;
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
                     // The receiver frees capacity with no other worker input.
-                    assert!(receive.try_recv().unwrap().is_some());
+                    assert_eq!(receive.try_recv(), Ok(Delivery::Changed));
                     // The same parked future completes after the drain.
                     assert!(ready.as_mut().await.is_ok());
                 }
@@ -1150,7 +1155,7 @@ mod tests {
             "the retained wake flushes once capacity returns"
         );
         let mut settings = 0;
-        while let Ok(Some(delivery)) = receive.try_recv() {
+        while let Ok(delivery) = receive.try_recv() {
             if matches!(delivery, Delivery::Settings) {
                 settings += 1;
             }
@@ -1184,13 +1189,13 @@ mod tests {
             !outbox.flush(&mut send),
             "a full channel retains lifecycle and completions"
         );
-        assert!(receive.try_recv().unwrap().is_some(), "one slot frees");
+        assert!(receive.try_recv().is_ok(), "one slot frees");
         assert!(
             !outbox.flush(&mut send),
             "one slot delivers one retained message"
         );
         let mut drained = Vec::new();
-        while let Ok(Some(delivery)) = receive.try_recv() {
+        while let Ok(delivery) = receive.try_recv() {
             drained.push(delivery);
             if drained.len() > 256 {
                 break;
@@ -1211,7 +1216,7 @@ mod tests {
             "remaining retained deliveries flush"
         );
         let mut tail = Vec::new();
-        while let Ok(Some(delivery)) = receive.try_recv() {
+        while let Ok(delivery) = receive.try_recv() {
             tail.push(delivery);
         }
         assert_eq!(
@@ -1319,26 +1324,30 @@ mod tests {
                 headers: BTreeMap::new(),
             }
         }
+        fn admit(
+            accepted: &mut VecDeque<(IncomingCommand, u8, String)>,
+            running: &mut usize,
+            spawned_total: &mut usize,
+        ) {
+            spawn_accepted(accepted, |command, rc, body| {
+                if *running < 4 {
+                    *running += 1;
+                    *spawned_total += 1;
+                    let _ = (command, rc, body);
+                    Ok(())
+                } else {
+                    Err((command, rc, body))
+                }
+            });
+        }
         let mut accepted: VecDeque<(IncomingCommand, u8, String)> = VecDeque::new();
         let mut running = 0;
         let mut spawned_total = 0;
-        let mut spawn = |accepted: &mut VecDeque<(IncomingCommand, u8, String)>| {
-            spawn_accepted(accepted, |command, rc, body| {
-                if running < 4 {
-                    running += 1;
-                    spawned_total += 1;
-                    let _ = (command, rc, body);
-                    true
-                } else {
-                    false
-                }
-            });
-        };
         for wave in 0..2 {
             for i in 0..3 {
-                accepted.push_back((command(wave * 10 + i), 0, "{}".into()));
+                accepted.push_back((command(wave * 3 + i), 0, "{}".into()));
             }
-            spawn(&mut accepted);
+            admit(&mut accepted, &mut running, &mut spawned_total);
         }
         assert_eq!(spawned_total, 4, "the running cap bounds spawned tasks");
         assert_eq!(
@@ -1353,7 +1362,7 @@ mod tests {
         );
         // One slot frees; the oldest retained reply is admitted next.
         running -= 1;
-        spawn(&mut accepted);
+        admit(&mut accepted, &mut running, &mut spawned_total);
         assert_eq!(spawned_total, 5);
         assert_eq!(accepted.len(), 1);
         assert_eq!(accepted.front().unwrap().0.command, "verb-5");
