@@ -1296,7 +1296,7 @@ async fn establish_attempt(ctx: &mut SupervisorCtx, attempt: u32) -> EstablishOu
         biased;
         _ = ctx.out_tx.closed() => return EstablishOutcome::Stop,
         _ = ctx.shutdown_rx.changed() => return EstablishOutcome::Stop,
-        _ = tokio::time::sleep_until(deadline) => {
+        _ = tokio::time::sleep_until(deadline.into()) => {
             return retry_or_fail(
                 ctx, attempt,
                 ClientError::Timeout { to: "noded".to_string() },
@@ -1331,7 +1331,10 @@ async fn establish_attempt(ctx: &mut SupervisorCtx, attempt: u32) -> EstablishOu
     let mut owner = AttemptOwner::new(connection.clone());
 
     // 3. Transaction mutex, preserving the old-socket ACK / new-socket
-    //    snapshot ordering, selected against stop and the deadline.
+    //    snapshot ordering, selected against stop and the deadline. Lock a
+    //    local Arc clone: the guard is held for the whole attempt, so its
+    //    borrow must not be on `ctx`, which every exit below needs mutably.
+    let transaction = ctx.subscription_transaction.clone();
     let _transaction = tokio::select! {
         biased;
         _ = ctx.out_tx.closed() => {
@@ -1342,7 +1345,7 @@ async fn establish_attempt(ctx: &mut SupervisorCtx, attempt: u32) -> EstablishOu
             owner.abort().await;
             return EstablishOutcome::Stop;
         }
-        _ = tokio::time::sleep_until(deadline) => {
+        _ = tokio::time::sleep_until(deadline.into()) => {
             owner.abort().await;
             return retry_or_fail(
                 ctx, attempt,
@@ -1350,7 +1353,7 @@ async fn establish_attempt(ctx: &mut SupervisorCtx, attempt: u32) -> EstablishOu
                 "transaction", None,
             );
         }
-        guard = ctx.subscription_transaction.lock() => guard,
+        guard = transaction.lock() => guard,
     };
 
     // 4. The topics this attempt must establish.
@@ -1375,7 +1378,7 @@ async fn establish_attempt(ctx: &mut SupervisorCtx, attempt: u32) -> EstablishOu
                 owner.abort().await;
                 return EstablishOutcome::Stop;
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(deadline.into()) => {
                 owner.abort().await;
                 return retry_or_fail(
                     ctx, attempt,
@@ -1456,6 +1459,7 @@ async fn establish_attempt(ctx: &mut SupervisorCtx, attempt: u32) -> EstablishOu
         return retry_or_fail(ctx, attempt, ClientError::Closed, "publication", None);
     };
 
+    let inner = ctx.inner.clone();
     let mut live = tokio::select! {
         biased;
         _ = ctx.out_tx.closed() => {
@@ -1466,7 +1470,7 @@ async fn establish_attempt(ctx: &mut SupervisorCtx, attempt: u32) -> EstablishOu
             owner.abort().await;
             return EstablishOutcome::Stop;
         }
-        _ = tokio::time::sleep_until(deadline) => {
+        _ = tokio::time::sleep_until(deadline.into()) => {
             owner.abort().await;
             return retry_or_fail(
                 ctx, attempt,
@@ -1474,7 +1478,7 @@ async fn establish_attempt(ctx: &mut SupervisorCtx, attempt: u32) -> EstablishOu
                 "publication", None,
             );
         }
-        guard = ctx.inner.write() => guard,
+        guard = inner.write() => guard,
     };
 
     // 9. Commit the staged declarations, swap the live connection, advance
@@ -1782,7 +1786,7 @@ mod tests {
         // One oversized topic.
         let big = "x".repeat(MAX_TOPIC_BYTES + 1);
         assert_eq!(
-            validate_declarations(&[big.clone()]).unwrap_err(),
+            validate_declarations(std::slice::from_ref(&big)).unwrap_err(),
             SubscriptionDeclarationError::Invalid {
                 index: Some(0),
                 message: format!("a topic exceeds {MAX_TOPIC_BYTES} UTF-8 bytes"),
@@ -1815,12 +1819,13 @@ mod tests {
     // the cancellation is exercised deterministically rather than raced.
 
     /// A one-connection native stub: ACK `noded.register` and each
-    /// `topic.subscribe` with rc 0, signal each receipt, and signal the
-    /// socket's close/EOF so the tests observe the owner's teardown.
+    /// `topic.subscribe` with rc 0, signal the first register and the first
+    /// subscribe receipt, and signal the socket's close/EOF so the tests
+    /// observe the owner's teardown.
     async fn mini_stub(
         listener: tokio::net::TcpListener,
-        register_seen: oneshot::Sender<()>,
-        subscribe_seen: Option<oneshot::Sender<()>>,
+        mut register_seen: Option<oneshot::Sender<()>>,
+        mut subscribe_seen: Option<oneshot::Sender<()>>,
         eof: oneshot::Sender<()>,
     ) {
         use futures_util::{SinkExt, StreamExt};
@@ -1847,13 +1852,16 @@ mod tests {
             if let Some(id) = request.get("id") {
                 reply = reply.with_header("id", id);
             }
-            let send_ok = websocket.send(Message::Text(reply.to_wire().into())).await.is_ok();
+            let send_ok = websocket
+                .send(Message::Text(reply.to_wire().into()))
+                .await
+                .is_ok();
             if command == "noded.register" {
-                let _ = register_seen.send(());
-            } else if command == "topic.subscribe" {
-                if let Some(seen) = &subscribe_seen {
+                if let Some(seen) = register_seen.take() {
                     let _ = seen.send(());
                 }
+            } else if command == "topic.subscribe" && let Some(seen) = subscribe_seen.take() {
+                let _ = seen.send(());
             }
             if !send_ok {
                 break;
@@ -1906,7 +1914,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (register_seen_tx, register_seen_rx) = oneshot::channel();
         let (eof_tx, eof_rx) = oneshot::channel();
-        let stub = tokio::spawn(mini_stub(listener, register_seen_tx, None, eof_tx));
+        let stub = tokio::spawn(mini_stub(listener, Some(register_seen_tx), None, eof_tx));
 
         let (mut ctx, shutdown_tx, _out_rx) =
             guard_test_ctx(&format!("ws://{address}/ws"), vec!["decl.a".to_string()]);
@@ -1955,7 +1963,7 @@ mod tests {
         let (eof_tx, eof_rx) = oneshot::channel();
         let stub = tokio::spawn(mini_stub(
             listener,
-            register_seen_tx,
+            Some(register_seen_tx),
             Some(subscribe_seen_tx),
             eof_tx,
         ));
@@ -2007,7 +2015,7 @@ mod tests {
         let (eof_tx, eof_rx) = oneshot::channel();
         let stub = tokio::spawn(mini_stub(
             listener,
-            register_seen_tx,
+            Some(register_seen_tx),
             Some(subscribe_seen_tx),
             eof_tx,
         ));
