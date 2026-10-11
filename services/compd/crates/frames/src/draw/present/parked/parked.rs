@@ -15,6 +15,15 @@
 //! that leaves pipes in flight swallows the redraw pings that would reach it),
 //! fires once, and re-arms only while something still waits. It never
 //! schedules a redraw, so an idle parked desktop costs nothing.
+//!
+//! One second per frame is too slow for work that needs a few frames in a row:
+//! a capture settles, draws and collects over about five frames, which took
+//! 5–6 s parked. So demand after a quiet spell gets a short burst first: when
+//! the trickle has sent nothing for [`BURST_QUIET`], the next [`BURST_FRAMES`]
+//! sends come [`BURST_INTERVAL`] apart, then the 1 Hz rate resumes. A client
+//! that keeps animating answers every callback within the second, so it never
+//! goes quiet and never refills the burst: the worst case is [`BURST_FRAMES`]
+//! extra frames per [`BURST_QUIET`].
 
 use crate::draw::present::callbacks::callbacks::{surface_awaits_frame, tree_awaits_frame, OCCLUDED_TRICKLE};
 use smithay::desktop::layer_map_for_output;
@@ -23,15 +32,34 @@ use smithay::output::Output;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use world::state::Loop;
 
 /// One callback per waiting surface at most this often while frames are parked.
 pub const PARKED_TRICKLE: Duration = OCCLUDED_TRICKLE;
 
+/// Fast sends a burst allows.
+pub const BURST_FRAMES: u32 = 8;
+/// The spacing of burst sends (about one 60 Hz frame).
+pub const BURST_INTERVAL: Duration = Duration::from_millis(16);
+/// How long the trickle must have sent nothing before the burst refills.
+pub const BURST_QUIET: Duration = Duration::from_secs(2);
+
 thread_local! {
     /// A parked-trickle timer is armed (one at a time).
     static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fast sends left in the current burst.
+    static BURST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// When the trickle last answered callbacks.
+    static LAST_SEND: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The delay before the next send, refilling the burst after a quiet spell.
+fn next_period(last_send: Option<Instant>, now: Instant, burst: &mut u32) -> Duration {
+    if last_send.is_none_or(|sent| now.duration_since(sent) >= BURST_QUIET) {
+        *burst = BURST_FRAMES;
+    }
+    if *burst > 0 { BURST_INTERVAL } else { PARKED_TRICKLE }
 }
 
 /// The output callbacks are attributed to: the active one, else any mapped one.
@@ -104,7 +132,8 @@ fn send(state: &Loop) {
 }
 
 /// Arm the parked trickle if frames are parked and some surface waits on a
-/// callback. Called on every main-loop pass while parked. `parked` is the backend's own
+/// callback: a burst send after a quiet spell, else the 1 Hz trickle.
+/// Called on every main-loop pass while parked. `parked` is the backend's own
 /// answer (`native.render.execute.frames_parked`), read again when the timer
 /// fires: once presentation resumes, the flip answers callbacks and the timer
 /// drops without sending.
@@ -112,12 +141,17 @@ pub fn arm(state: &Loop, parked: fn(&Loop) -> bool) {
     if ARMED.get() || !parked(state) || !waiting(state) {
         return;
     }
+    let mut burst = BURST.get();
+    let period = next_period(LAST_SEND.get(), Instant::now(), &mut burst);
+    BURST.set(burst);
     let armed = state.loop_handle.insert_source(
-        Timer::from_duration(PARKED_TRICKLE),
+        Timer::from_duration(period),
         move |_, _, state: &mut Loop| {
             ARMED.set(false);
             if parked(state) {
                 send(state);
+                LAST_SEND.set(Some(Instant::now()));
+                BURST.set(BURST.get().saturating_sub(1));
                 let _ = state.inner.loader.display_handle.flush_clients();
                 arm(state, parked);
             }
@@ -127,5 +161,35 @@ pub fn arm(state: &Loop, parked: fn(&Loop) -> bool) {
     match armed {
         Ok(_) => ARMED.set(true),
         Err(error) => warn!("parked frame trickle not armed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_demand_bursts() {
+        let mut burst = 0;
+        assert_eq!(next_period(None, Instant::now(), &mut burst), BURST_INTERVAL);
+        assert_eq!(burst, BURST_FRAMES);
+    }
+
+    #[test]
+    fn spent_burst_trickles_until_quiet() {
+        let sent = Instant::now();
+        let mut burst = 0;
+        assert_eq!(next_period(Some(sent), sent + PARKED_TRICKLE, &mut burst), PARKED_TRICKLE);
+        assert_eq!(burst, 0);
+        assert_eq!(next_period(Some(sent), sent + BURST_QUIET, &mut burst), BURST_INTERVAL);
+        assert_eq!(burst, BURST_FRAMES);
+    }
+
+    #[test]
+    fn burst_in_progress_is_not_refilled() {
+        let sent = Instant::now();
+        let mut burst = 3;
+        assert_eq!(next_period(Some(sent), sent + BURST_INTERVAL, &mut burst), BURST_INTERVAL);
+        assert_eq!(burst, 3);
     }
 }
