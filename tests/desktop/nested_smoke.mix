@@ -1,5 +1,5 @@
 -- nested_smoke.mix — headless runtime smoke for compd on a build worker.
--- version: 0.43.1
+-- version: 0.44.0
 --
 --   mix tests/desktop/nested_smoke.mix <compositor-binary> [--secs N] [--config-file PATH]
 --       [--bus [--watch-script PATH] [--truth-self-test] [--layer-client PATH]]
