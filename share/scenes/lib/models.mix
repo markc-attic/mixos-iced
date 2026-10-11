@@ -82,8 +82,22 @@ fn icon_choice($paths, $name, $fallback)
   return {icon: $path, has_icon: $path != ""}
 end
 
+-- The longest workspace name the pager draws before it elides.
+$WS_LABEL_MAX = 14
+
+-- A pager button's label: the workspace's name (comp.workspace.rename), else
+-- its number. A long name is cut with an ellipsis so one name cannot crowd
+-- the task list out.
+fn workspace_label($names, $index)
+  $name = $index <= len($names) ? $names[$index - 1] : nil
+  if type($name) != "string" or trim($name) == "" then return to_string($index) end
+  if len($name) > $WS_LABEL_MAX then return slice($name, 0, $WS_LABEL_MAX - 1) .. "…" end
+  return $name
+end
+
 -- The bottom panel's complete runtime model, as the legacy builder drew it.
 -- $snap: {windows (normal band, id order), ws_count, ws_current,
+--         ws_names (one per workspace, nil unnamed; absent = numbers),
 --         tasks_scope ("all" | "current"; absent = "current", what a
 --         behaviour copy older than the setting draws), tray,
 --         notes_count, net:{up,wireless}, vol:{ok,level,muted},
@@ -104,7 +118,7 @@ fn panel($snap, $icons, $now)
   $workspaces = []
   for $i = 1 to $snap.ws_count ?? 1
     $current = $i == $ws_current
-    push($workspaces, {id: "ws_" .. to_string($i), cells: [], index: $i, label: to_string($i),
+    push($workspaces, {id: "ws_" .. to_string($i), cells: [], index: $i, label: workspace_label($snap.ws_names ?? [], $i),
       current: $current, background: $current ? $C.accent : $C.task_bg, color: $current ? "#0b1f2b" : $C.dim})
   end
 

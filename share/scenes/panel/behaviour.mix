@@ -1,4 +1,4 @@
--- version: 0.2.2
+-- version: 0.3.0
 -- The bottom panel's behaviour: compositor, tray, notification and popup
 -- state in; one complete model out through the loader (scenes.model). The
 -- layout is static in scene.mix. Clicks arrive as {scene,node,kind,item?};
@@ -75,7 +75,7 @@ fn empty_icons()
   return {themed: {}, plain: {}, windows: {}}
 end
 
-$state = {ready: false, windows: [], ws_count: 1, ws_current: 1, tray: [], notes_count: 0,
+$state = {ready: false, windows: [], ws_count: 1, ws_current: 1, ws_names: [], tray: [], notes_count: 0,
   net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
   open: {launcher: false, calendar: false, notes: false}, peeked: [], peek_busy: false,
   icons: empty_icons(), services: [], dirty: false, rebuilding: false, clock_armed: false, status_refreshing: false,
@@ -190,12 +190,32 @@ fn fetch_windows()
   $out = $r.call($COMP, "comp.windows.list", {})
   if not $out.ok or type($out.value) != "map" or type($out.value.windows) != "list" then return false end
   $state.windows = $t.normal_windows($out.value.windows)
-  $ws = $r.call($COMP, "comp.props.get", {path: "workspaces"})
-  if $ws.ok and type($ws.value) == "map" then
-    $state.ws_count = $ws.value.count ?? 1
-    $state.ws_current = $ws.value.current ?? 1
-  end
+  apply_workspaces(read_workspaces())
   return true
+end
+
+-- comp.workspaces.list: count, current and one {index, windows, name} row per
+-- workspace. A compd without it (unknown_verb) answers the same object from
+-- the props tree, with no names.
+fn read_workspaces()
+  $ws = $r.call($COMP, "comp.workspaces.list", {})
+  if $ws.ok and type($ws.value) == "map" then return $ws.value end
+  $ws = $r.call($COMP, "comp.props.get", {path: "workspaces"})
+  if $ws.ok and type($ws.value) == "map" then return $ws.value end
+  return nil
+end
+
+fn apply_workspaces($ws)
+  if type($ws) != "map" then return end
+  $state.ws_count = $ws.count ?? 1
+  $state.ws_current = $ws.current ?? 1
+  $names = []
+  if type($ws.list) == "list" then
+    for each $row in $ws.list
+      push($names, type($row) == "map" ? $row.name : nil)
+    end
+  end
+  $state.ws_names = $names
 end
 
 fn fetch_tray()
@@ -286,7 +306,7 @@ fn resolve_icons()
 end
 
 fn snapshot()
-  return {windows: $state.windows, ws_count: $state.ws_count, ws_current: $state.ws_current,
+  return {windows: $state.windows, ws_count: $state.ws_count, ws_current: $state.ws_current, ws_names: $state.ws_names,
     tasks_scope: $state.tasks_scope, tray: $state.tray, notes_count: $state.notes_count, net: $state.net, vol: $state.vol,
     open: $state.open, peeked: length($state.peeked) > 0}
 end
@@ -578,6 +598,12 @@ on props.changed
   if gap($event) then resync() else schedule() end
 end
 
+-- comp.workspace.changed: count, current or a name moved. The rebuild
+-- re-reads comp.workspaces.list, so the event is only the hint.
+on workspace.changed
+  if gap($event) then resync() else schedule() end
+end
+
 on tray.item.added
   schedule()
 end
@@ -702,6 +728,7 @@ end
 
 -- ── init: subscribe before the first snapshot ───────────────────────────
 subscribe($COMP .. ".props.changed")
+subscribe($COMP .. ".workspace.changed")
 subscribe($TRAY .. ".item.added")
 subscribe($TRAY .. ".item.removed")
 subscribe($TRAY .. ".props.changed")
