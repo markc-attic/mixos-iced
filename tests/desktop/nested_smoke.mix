@@ -1191,8 +1191,9 @@ if $bus then
     finish(false, "comp.window.stats {source}: rc " .. to_string($rc) .. " " .. json_encode($reply), [$kp, $cp, $wp])
   end
   print("bus: presentation: wait presented ok; stats presented " .. to_string($st.presented) .. ", interval p50 " .. to_string($st.interval_p50_us) .. " us; output frames " .. to_string($ofr) .. "; reset ok")
-  -- 12. workspaces: hide the client by switching away, prove it gets no frame
-  -- callbacks (a frame-driven client stops committing), then bring it back.
+  -- 12. workspaces: hide the client by switching away, prove it gets only the
+  -- 1 Hz trickle (a frame-driven client commits about once a second, not at
+  -- the refresh rate, and never stops), then bring it back.
   $sw = switch_once($SVC, 2)
   if $sw.rc != 0 or type($sw.reply) != "map" or $sw.reply.from != 1 or $sw.reply.to != 2 then
     finish(false, "comp.workspace.switch 2: rc " .. to_string($sw.rc) .. " " .. json_encode($sw.reply), [$kp, $cp, $wp])
@@ -1205,10 +1206,10 @@ if $bus then
   $c1 = commits_of($SVC, $wid)
   sleep(1.5)
   $c2 = commits_of($SVC, $wid)
-  if $c1 == nil or $c2 != $c1 then
-    finish(false, "hidden window kept committing (frame callbacks still sent?): " .. json_encode($c1) .. " -> " .. json_encode($c2) .. " over 1.5 s", [$kp, $cp, $wp])
+  if $c1 == nil or $c2 == nil or $c2 - $c1 < 1 or $c2 - $c1 > 3 then
+    finish(false, "hidden window not on the 1 Hz trickle (want 1..3 commits over 1.5 s): " .. json_encode($c1) .. " -> " .. json_encode($c2), [$kp, $cp, $wp])
   end
-  print("bus: workspace 2: s" .. to_string($wid) .. " hidden, commits held at " .. to_string($c2) .. " for 1.5 s")
+  print("bus: workspace 2: s" .. to_string($wid) .. " hidden, trickled " .. to_string($c2 - $c1) .. " commit(s) in 1.5 s")
   truth_matches($SVC, "truth on workspace 2", [$kp, $cp, $wp])
   $sw = switch_once($SVC, 1)
   if $sw.rc != 0 or type($sw.reply) != "map" or $sw.reply.to != 1 then
@@ -1239,10 +1240,10 @@ if $bus then
   $c1 = commits_of($SVC, $wid)
   sleep(1.5)
   $c2 = commits_of($SVC, $wid)
-  if $c1 == nil or $c2 != $c1 then
-    finish(false, "minimised window kept committing: " .. json_encode($c1) .. " -> " .. json_encode($c2), [$kp, $cp, $wp])
+  if $c1 == nil or $c2 == nil or $c2 - $c1 < 1 or $c2 - $c1 > 3 then
+    finish(false, "minimised window not on the 1 Hz trickle (want 1..3 commits over 1.5 s): " .. json_encode($c1) .. " -> " .. json_encode($c2), [$kp, $cp, $wp])
   end
-  print("bus: minimised s" .. to_string($wid) .. ", commits held at " .. to_string($c2))
+  print("bus: minimised s" .. to_string($wid) .. ", trickled " .. to_string($c2 - $c1) .. " commit(s) in 1.5 s")
   truth_matches($SVC, "truth minimised", [$kp, $cp, $wp])
   $r = restore_once($SVC, $wid, $gen)
   if $r.rc != 0 or type($r.reply) != "map" or $r.reply.minimized != false then

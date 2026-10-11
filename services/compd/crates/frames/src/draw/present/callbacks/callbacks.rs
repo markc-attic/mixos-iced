@@ -130,6 +130,7 @@ pub fn surface_awaits_frame(surface: &smithay::reexports::wayland_server::protoc
 /// callbacks (egui answering Bus verbs) stalled until it was shown again.
 fn trickle_targets(state: &Loop) -> Vec<(Window, Output)> {
     use dispatcher::wire::trait_::surface_event::SurfaceHandle;
+    use dispatcher::wire::trait_::wire_trait::WireTrait;
     use world::window::interface::record::window::LoopWindow;
     // Under a session lock only the lock surface gets callbacks (batch C), and
     // the cull is not run, so the record's decisions are stale: no trickle.
@@ -158,12 +159,16 @@ fn trickle_targets(state: &Loop) -> Vec<(Window, Output)> {
     else {
         return targets;
     };
-    for window in space.elements() {
-        if SurfaceHandle::of_window(window).is_some_and(|handle| comp.hidden(&handle))
-            && !targets.iter().any(|(w, _)| w == window)
-            && awaits_frame(window)
-        {
-            targets.push((window.clone(), output.clone()));
+    // Every world, not only the spawn target: a hidden client in a world that
+    // is not hosted keeps its policy state and its pending callbacks.
+    for world_space in state.inner.all_world_spaces() {
+        for window in world_space.state.elements() {
+            if SurfaceHandle::of_window(window).is_some_and(|handle| comp.hidden(&handle))
+                && !targets.iter().any(|(w, _)| w == window)
+                && awaits_frame(window)
+            {
+                targets.push((window.clone(), output.clone()));
+            }
         }
     }
     targets
