@@ -122,18 +122,22 @@ pub fn surface_awaits_frame(surface: &smithay::reexports::wayland_server::protoc
     pending.get()
 }
 
-/// The occluded windows still waiting on a callback, with an output each was
-/// occluded on.
+/// The windows the trickle answers, with an output to attribute each callback
+/// to: occluded windows (covered on a pane), and windows the comp policy hides
+/// (minimised, or on a workspace that is not current). A hidden window is on no
+/// pane, so the occlusion record calls it `unknown` and never lists it; without
+/// this it got no callback at all, and a client that runs its UI loop on
+/// callbacks (egui answering Bus verbs) stalled until it was shown again.
 fn trickle_targets(state: &Loop) -> Vec<(Window, Output)> {
+    use dispatcher::wire::trait_::surface_event::SurfaceHandle;
     use world::window::interface::record::window::LoopWindow;
-    let occluded = world::window::draw::occlude::record::occluded();
     // Under a session lock only the lock surface gets callbacks (batch C), and
     // the cull is not run, so the record's decisions are stale: no trickle.
-    if occluded.is_empty() || world::comp::session_lock::active(state) {
+    if world::comp::session_lock::active(state) {
         return Vec::new();
     }
     let space = &state.inner.space_state().state;
-    occluded
+    let mut targets: Vec<(Window, Output)> = world::window::draw::occlude::record::occluded()
         .into_iter()
         .filter_map(|(uuid, outputs)| {
             let window = space.elements().find(|w| w.uuid() == Some(uuid))?.clone();
@@ -143,14 +147,35 @@ fn trickle_targets(state: &Loop) -> Vec<(Window, Output)> {
                 .clone();
             awaits_frame(&window).then_some((window, output))
         })
-        .collect()
+        .collect();
+    let comp = &state.inner.comp;
+    let active = state.inner.active_output_key();
+    let Some(output) = space
+        .outputs()
+        .find(|o| world::state::state::output_key(o) == active)
+        .or_else(|| space.outputs().next())
+        .cloned()
+    else {
+        return targets;
+    };
+    for window in space.elements() {
+        if SurfaceHandle::of_window(window).is_some_and(|handle| comp.hidden(&handle))
+            && !targets.iter().any(|(w, _)| w == window)
+            && awaits_frame(window)
+        {
+            targets.push((window.clone(), output.clone()));
+        }
+    }
+    targets
 }
 
-/// Arm the trickle when an occluded window waits on a callback: a one-shot
-/// timer sends it (throttled by smithay to once per [`OCCLUDED_TRICKLE`] per
-/// surface) and re-arms only while some covered window still waits. Never
-/// schedules a redraw: a covered window that stays idle costs no frame and,
-/// once its callback is answered, no further wake.
+/// Arm the trickle when an occluded or hidden window waits on a callback: a
+/// one-shot timer sends it (throttled by smithay to once per
+/// [`OCCLUDED_TRICKLE`] per surface) and re-arms only while such a window
+/// still waits. Never schedules a redraw: a window that stays idle costs no
+/// frame and, once its callback is answered, no further wake. Called after
+/// each presented frame and on every main-loop pass: a hidden window's commit
+/// damages nothing, so no frame may follow it to arm the timer.
 pub fn trickle(state: &Loop) {
     if TRICKLE_ARMED.get() || trickle_targets(state).is_empty() {
         return;
