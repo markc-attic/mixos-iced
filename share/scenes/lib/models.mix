@@ -82,16 +82,27 @@ fn icon_choice($paths, $name, $fallback)
   return {icon: $path, has_icon: $path != ""}
 end
 
--- The longest workspace name the pager draws before it elides.
+-- The longest workspace name the pager draws before it elides, and the
+-- characters all the pager's labels may use together: with many named
+-- workspaces each name gets an equal share (at least 3), so the pager cannot
+-- crowd the task list and the status area off the panel.
 $WS_LABEL_MAX = 14
+$WS_LABELS_BUDGET = 48
+
+-- The per-name character limit for $count workspaces.
+fn workspace_label_max($count)
+  $share = floor($WS_LABELS_BUDGET / max(1, $count))
+  return min($WS_LABEL_MAX, max(3, $share))
+end
 
 -- A pager button's label: the workspace's name (comp.workspace.rename), else
--- its number. A long name is cut with an ellipsis so one name cannot crowd
--- the task list out.
-fn workspace_label($names, $index)
+-- its number. A name longer than $limit characters (default $WS_LABEL_MAX)
+-- is cut with an ellipsis.
+fn workspace_label($names, $index, $limit = nil)
+  $limit = $limit ?? $WS_LABEL_MAX
   $name = $index <= len($names) ? $names[$index - 1] : nil
   if type($name) != "string" or trim($name) == "" then return to_string($index) end
-  if len($name) > $WS_LABEL_MAX then return slice($name, 0, $WS_LABEL_MAX - 1) .. "…" end
+  if len($name) > $limit then return slice($name, 0, $limit - 1) .. "…" end
   return $name
 end
 
@@ -118,7 +129,7 @@ fn panel($snap, $icons, $now)
   $workspaces = []
   for $i = 1 to $snap.ws_count ?? 1
     $current = $i == $ws_current
-    push($workspaces, {id: "ws_" .. to_string($i), cells: [], index: $i, label: workspace_label($snap.ws_names ?? [], $i),
+    push($workspaces, {id: "ws_" .. to_string($i), cells: [], index: $i, label: workspace_label($snap.ws_names ?? [], $i, workspace_label_max($snap.ws_count ?? 1)),
       current: $current, background: $current ? $C.accent : $C.task_bg, color: $current ? "#0b1f2b" : $C.dim})
   end
 

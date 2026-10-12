@@ -209,10 +209,17 @@ fn apply_workspaces($ws)
   if type($ws) != "map" then return end
   $state.ws_count = $ws.count ?? 1
   $state.ws_current = $ws.current ?? 1
+  -- Placed by each row's own index, so a sparse or reordered list cannot
+  -- shift a name onto the wrong button.
   $names = []
+  for $i = 1 to $state.ws_count
+    push($names, nil)
+  end
   if type($ws.list) == "list" then
     for each $row in $ws.list
-      push($names, type($row) == "map" ? $row.name : nil)
+      if type($row) == "map" and type($row.index) == "number" and $row.index >= 1 and $row.index <= $state.ws_count then
+        $names[$row.index - 1] = $row.name
+      end
     end
   end
   $state.ws_names = $names
